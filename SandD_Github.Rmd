@@ -1,0 +1,1006 @@
+---
+title: "SandD"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#Libraries, don't need all of these I include too many
+```{r libs, include=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tidyr)
+  library(MuMIn)
+  library(readr)
+  library(performance)
+  library(janitor)
+  library(stringr)
+  library(lubridate)
+  library(ggplot2)
+  library(ggpubr)
+  library(boot)
+  library(MuMIn)
+  library(corrplot)
+  library(psych)
+  library(car)
+  library(lme4)
+  library(lmerTest)
+  library(patchwork)
+  library(nlme)
+  library(circular)
+})
+```
+#Setup subject data
+```{r Laod data}
+#I've used 4 sessions per person, each consisting of 7 full days of actigraphy, can change if you'd like more/less
+min_sessions <- 4
+min_days     <- 7
+#load paths to datasets, downloaded from nsrr
+actigraphy_path  <- #TO:DO Update this path to your directory ("your_path_here")
+demographix_path <- #TO:DO Update this path to your directory ("your_path_here")
+df          <- read.csv(actigraphy_path)
+demographix <- read.csv(demographix_path)
+to_min <- function(time_str) {
+  parts <- strsplit(time_str, ":")
+  sapply(parts, function(p) {
+    as.numeric(p[1]) * 60 + as.numeric(p[2])
+  })
+}
+#function for dealing with time as a circular construct as linear means won't return correct vals.
+circular_sd_hr <- function(x_min) {
+  x_min <- x_min[!is.na(x_min)] 
+  if (length(x_min) < 2) return(NA_real_) #ensure calc doesn't fail on missing data
+  ang <- circular((x_min %% 1440) / 1440 * 2*pi, units = "radians", template = "clock24") #convert to rads
+  as.numeric(sd.circular(ang)) * (24 / (2*pi))
+}
+
+#Flag sessions with sufficient nights and DLMO
+session_night_counts <- df %>%
+  group_by(id, session) %>%
+  summarise(
+    n_nights     = n(),
+    has_midsleep = sum(!is.na(mid)) >= min_days,
+    .groups      = "drop"
+  )
+
+dlmo_availability <- demographix %>%
+  mutate(id = as.character(id), session = as.character(session)) %>%
+  #keep only these bits from demographix
+  select(id, session, DLMO = dlmo) %>%
+  #new col to identify missing dlmo's
+  mutate(has_dlmo = !is.na(DLMO))
+
+valid_sessions <- session_night_counts %>%
+  mutate(id = as.character(id), session = as.character(session)) %>%
+  left_join(dlmo_availability, by = c("id", "session")) %>%
+  filter(n_nights >= min_days, has_midsleep, has_dlmo) %>%
+  select(id, session, n_nights)
+
+#Retain first 4 valid sessions per subject, sorting needs to be done per-participant not globally
+eligible_sessions <- valid_sessions %>%
+  group_by(id) %>%
+  arrange(session, .by_group = TRUE) %>%
+  #rank existing participant sessions
+  mutate(session_rank = row_number()) %>%
+  filter(session_rank <= min_sessions) %>%
+  ungroup()
+#Keep only subjects with  4 sessions
+eligible_subjects <- eligible_sessions %>%
+  group_by(id) %>%
+  summarise(n_valid = n()) %>%
+  filter(n_valid == min_sessions) %>%
+  pull(id)
+#only keep participants who meet participant level criteria
+eligible_sessions <- eligible_sessions %>%
+  filter(id %in% eligible_subjects)
+
+#Build night-level dataset (first 7 nights per session)
+analysis_df <- df %>%
+  mutate(id = as.character(id), session = as.character(session)) %>%
+  semi_join(eligible_sessions, by = c("id", "session")) %>%
+  group_by(id, session) %>%
+  arrange(days_numbersincesessiononestart, .by_group = TRUE) %>%
+  slice_head(n = min_days) %>%
+  ungroup() %>% #don't need most of these so can drop as needed
+  select(id, session, days_numbersincesessiononestart, sday, stime, etime, mid, dur, seff, waso) %>%
+  left_join(
+    demographix %>%
+      mutate(id = as.character(id), session = as.character(session)) %>%
+      select(id, session, DLMO = dlmo, agey, agedec_stdate, female_yesno,
+             tannerph, rcmas_sum, cesd_tot2, bdi_score2, smith_tot2, rutter_total, season, height_physexam , weight_physexam, race,  shs_pubertal_category2),
+    by = c("id", "session")
+  )
+```
+#Session level segreation 
+```{r Segregate}
+#Convert time to minutes and hours from form data was downloaded in (mins) 
+analysis_df <- analysis_df %>%
+  mutate(
+    onset_min    = to_min(stime),
+    offset_min   = to_min(etime),
+    midsleep_min = to_min(mid),
+    duration_hr  = dur / 60,
+    onset_hr     = onset_min / 60,
+    offset_hr    = offset_min / 60,
+    midsleep_hr  = midsleep_min / 60
+  )
+
+#Assign cohort based on baseline age
+cohort_map <- analysis_df %>%
+  group_by(id) %>%
+  arrange(session) %>%
+  slice_head(n = 1) %>% # get earliest session per participant 
+  ungroup() %>%
+  mutate(cohort = ifelse(agey >= 9 & agey <= 11, "Younger", "Older")) %>% #can change   these depending upon what way you'd like to separate cohorts. 
+  select(id, cohort)
+
+#Compute phase angle and day type at night level
+night_df <- analysis_df %>%
+  left_join(cohort_map, by = "id") %>%
+  mutate(
+    phase_angle_midsleep_min = ((midsleep_min - (DLMO * 60)) %% 1440),
+    phase_angle_hr           = phase_angle_midsleep_min / 60,
+    day_type                 = ifelse(sday %in% c("Fri", "Sat"), "free", "school"), 
+    BMI                      = weight_physexam / (height_physexam^2) * 703) #BMI needs to be converted to kg/m2 but data is in american format (inches/pounds)
+#compute cpd and it's components to correlate with midsleep SD 
+compute_cpd <- function(analysis_df) {
+  analysis_df <- analysis_df %>%
+    arrange(days_numbersincesessiononestart)
+  #CPD formula taken from https://pmc.ncbi.nlm.nih.gov/articles/PMC8503839/#abstract1
+  free_day <- c("Fri","Sat")
+  
+  msf <- mean(analysis_df$midsleep_hr[analysis_df$sday %in% free_day], na.rm = TRUE)
+  dur_free <- mean(analysis_df$duration_hr[analysis_df$sday %in% free_day], na.rm = TRUE)
+  dur_week <- mean(analysis_df$duration_hr, na.rm = TRUE)
+  msfsc <- msf - (dur_free - dur_week) / 2
+  
+  analysis_df <- analysis_df %>%
+    mutate(
+      xi = midsleep_hr - msfsc,
+      yi = midsleep_hr - lag(midsleep_hr),
+      cpd_i = sqrt(xi^2 + yi^2)
+    ) %>% 
+    filter(!is.na(cpd_i))
+  
+  tibble(
+    cpd = mean(analysis_df$cpd_i, na.rm = TRUE),
+    delta_ct_mean = mean(abs(analysis_df$xi), na.rm = TRUE),
+    delta_dd_mean = mean(abs(analysis_df$yi), na.rm = TRUE)
+  )
+}
+
+session_cpd <- analysis_df %>%
+  group_by(id, session) %>%
+  group_modify(~ compute_cpd(.x)) %>%
+  ungroup()
+#Aggregate to session level, can drop some of these if not needed 
+session_df <- night_df %>%
+  group_by(id, session, cohort) %>%
+  summarise(
+    DLMO            = first(DLMO),
+    phase_angle_sd  = circular_sd_hr(phase_angle_midsleep_min),
+    midsleep_sd     = circular_sd_hr(midsleep_min),
+    midsleep_free   = mean(midsleep_hr[day_type == "free"],   na.rm = TRUE),
+    midsleep_school = mean(midsleep_hr[day_type == "school"], na.rm = TRUE),
+    duration_free   = mean(duration_hr[day_type == "free"], na.rm = TRUE),
+    duration_work   = mean(duration_hr[day_type == "school"], na.rm = TRUE),
+    bdi             = first(bdi_score2),
+    cesd            = first(cesd_tot2),
+    rcmas           = first(rcmas_sum),
+    puberty_stage   = first(tannerph),
+    rutter          = first(rutter_total),
+    race            = first(race),
+    BMI             = first(BMI),
+    smith           = first(smith_tot2),
+    age             = first(agedec_stdate),
+    duration        = mean(duration_hr, na.rm = TRUE),
+    female          = first(female_yesno),
+    season          = first(season),
+    .groups         = "drop"
+  ) %>%
+  mutate(
+    sjl        = abs(midsleep_free - midsleep_school),
+    msfsc      = midsleep_free - (duration_free-duration_work)/2,
+    bdi_z      = (bdi  - mean(bdi,  na.rm = TRUE)) / sd(bdi,  na.rm = TRUE),
+    cesd_z     = (cesd - mean(cesd, na.rm = TRUE)) / sd(cesd, na.rm = TRUE),
+    depression = case_when(
+      cohort == "Younger" ~ bdi_z,
+      cohort == "Older"   ~ cesd_z
+    ),
+    is_summer  = as.numeric(tolower(trimws(season)) %in% c("summer", "4"))
+  ) %>%
+  left_join(session_cpd, by = c("id", "session")) %>%
+  group_by(id) %>%
+  arrange(session) %>%
+  mutate(wave = row_number() - 1) %>%
+  ungroup()
+cat("Total sessions:", nrow(session_df), "\n")
+cat("Subjects:", n_distinct(session_df$id), "\n")
+cat("Younger cohort:", sum(session_df$cohort == "Younger") / 4, "\n")
+cat("Older cohort:", sum(session_df$cohort == "Older") / 4, "\n")
+
+cor_mat <- session_df %>% #not necesarry for analysis just interesting to note.
+  select(phase_angle_sd, sjl, rcmas, smith, age, cpd, is_summer, msfsc, puberty_stage) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(3)
+
+#Merge with phase_angle_sd 
+session_data <- session_df %>%
+  select(id, session, phase_angle_sd) %>%
+  left_join(session_cpd, by = c("id", "session"))
+
+#Correlations, use spearman just cause relationships are probably non-normal 
+cor(session_data %>% select(phase_angle_sd, cpd, delta_ct_mean, delta_dd_mean), 
+    use = "complete.obs", method = "spearman")
+#SD-based variability measures per participant per session
+sd_df <- night_df %>%
+  group_by(id, session, cohort) %>%
+  summarise(
+    onset_circ_sd_hr    = circular_sd_hr(onset_hr * 60),
+    offset_circ_sd_hr   = circular_sd_hr(offset_hr * 60),
+    midsleep_circ_sd_hr = circular_sd_hr(midsleep_hr * 60),
+    duration_sd_hr      = sd(duration_hr, na.rm = TRUE),
+    .groups             = "drop"
+  )
+print(cor_mat)
+write.csv(cor_mat, "your path here")
+```
+#Demographics for each cohort
+```{r demographics}
+#just make sure that the vars are saved using the appropriate names otherwise this code won't run
+#Mean vals of interest, can concatenate into table if needed 
+older_summary <- session_df %>%
+  filter(cohort == "Older", wave == 0) %>%
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    mean_DLMO = mean(DLMO, na.rm = TRUE),
+    sd_DLMO = sd(DLMO, na.rm = TRUE),
+    mean_BMI = mean(BMI, na.rm = TRUE),
+    sd_BMI = sd(BMI, na.rm = TRUE),
+    mean_rutter = mean(rutter, na.rm = TRUE),
+    sd_rutter = sd(rutter, na.rm = TRUE),
+    mean_rcmas = mean(rcmas, na.rm = TRUE),
+    sd_rcmas = sd(rcmas, na.rm = TRUE), 
+    mean_sjl = mean(sjl, na.rm = TRUE),
+    sd_sjl = sd(sjl, na.rm = TRUE),
+    mean_cesd = mean(cesd),
+    sd_cesd = sd(cesd)
+  )
+younger_summary <- session_df %>%
+  filter(cohort == "Younger", wave == 0) %>%
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    mean_DLMO = mean(DLMO, na.rm = TRUE),
+    sd_DLMO = sd(DLMO, na.rm = TRUE),
+    mean_BMI = mean(BMI, na.rm = TRUE),
+    sd_BMI = sd(BMI, na.rm = TRUE),
+    mean_rutter = mean(rutter, na.rm = TRUE),
+    sd_rutter = sd(rutter, na.rm = TRUE),
+    mean_rcmas = mean(rcmas, na.rm = TRUE),
+    sd_rcmas = sd(rcmas, na.rm = TRUE), 
+    mean_sjl = mean(sjl, na.rm = TRUE),
+    sd_sjl = sd(sjl, na.rm = TRUE),
+    mean_bdi = mean(bdi),
+    sd_bdi = sd(bdi)
+  )
+
+#Sex split
+sex_split <- session_df %>%
+  filter(cohort == "Younger", wave == 0, female == 1) %>%
+  count(female)
+#race tabulation
+race_by_subject <- session_df %>%
+  filter(cohort == "Younger", wave == 0) %>%
+  dplyr::distinct(id, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    race_cat = dplyr::case_when(
+      race == 1 ~ "White",
+      race == 2 ~ "Black or African American",
+      race == 3 | race == 7 ~ "Hispanic",
+      race == 6 ~ "Multiple races",
+      TRUE ~ NA_character_
+    ),
+    race_cat = factor(
+      race_cat,
+      levels = c(
+        "White",
+        "Black or African American",
+        "Hispanic",
+        "Multiple races"
+      )
+    )
+  ) %>%
+  dplyr::select(id = id, race = race, race_cat) %>%
+  dplyr::arrange(race_cat, id)
+race_tally <- race_by_subject %>%
+  dplyr::count(race_cat, name = "n") %>%
+  dplyr::arrange(race_cat)
+print(race_tally)
+
+#sd-based variability summaries per cohort, older cohort
+older_sd_summary <- sd_df %>%
+  filter(cohort == "Older") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  summarise(
+    mean_onset_sd = mean(onset_circ_sd_hr, na.rm = TRUE),
+    sd_onset_sd = sd(onset_circ_sd_hr, na.rm = TRUE),
+    mean_offset_sd = mean(offset_circ_sd_hr, na.rm = TRUE),
+    sd_offset_sd = sd(offset_circ_sd_hr, na.rm = TRUE),
+    mean_midsleep_sd = mean(midsleep_circ_sd_hr, na.rm = TRUE),
+    sd_midsleep_sd = sd(midsleep_circ_sd_hr, na.rm = TRUE),
+    mean_duration_sd = mean(duration_sd_hr, na.rm = TRUE),
+    sd_duration_sd = sd(duration_sd_hr, na.rm = TRUE)
+  )
+younger_sd_summary <- sd_df %>%
+  filter(cohort == "Younger") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  summarise(
+    mean_onset_sd = mean(onset_circ_sd_hr, na.rm = TRUE),
+    sd_onset_sd = sd(onset_circ_sd_hr, na.rm = TRUE),
+    mean_offset_sd = mean(offset_circ_sd_hr, na.rm = TRUE),
+    sd_offset_sd = sd(offset_circ_sd_hr, na.rm = TRUE),
+    mean_midsleep_sd = mean(midsleep_circ_sd_hr, na.rm = TRUE),
+    sd_midsleep_sd = sd(midsleep_circ_sd_hr, na.rm = TRUE),
+    mean_duration_sd = mean(duration_sd_hr, na.rm = TRUE),
+    sd_duration_sd = sd(duration_sd_hr, na.rm = TRUE)
+  )
+
+#puberty counters
+puberty_by_subject <- session_df %>%
+  filter(cohort == "Older", wave == 0) %>%
+  dplyr::distinct(id, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    puberty_cat = dplyr::case_when(
+      puberty_stage == 1 ~ "Stage 1",
+      puberty_stage == 2 ~ "Stage 2",
+      puberty_stage == 3 ~ "Stage 3",
+      puberty_stage == 4 ~ "Stage 4",
+      puberty_stage == 5 ~ "Stage 5",
+      TRUE ~ NA_character_
+    ),
+    puberty_cat = factor(
+      puberty_cat,
+      levels = c(
+        "Stage 1",
+        "Stage 2",
+        "Stage 3",
+        "Stage 4",
+        "Stage 5"
+      )
+    )
+  ) %>%
+  dplyr::select(id = id, pub_score = puberty_stage, puberty_cat) %>%
+  dplyr::arrange(puberty_cat, id)
+pub_tally <- puberty_by_subject %>%
+  dplyr::count(puberty_cat, name = "n") %>%
+  dplyr::arrange(puberty_cat)
+print(pub_tally)
+
+#MEQ categories
+meq_by_subject <- session_df %>%
+  filter(cohort == "Younger", wave == 0) %>%
+  dplyr::distinct(id, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    MEQ_category = dplyr::case_when(
+      smith <= 22 ~ "Evening Type",
+      smith >=23  & smith <= 43 ~ "Intermediate Type",
+      smith >= 44 & smith <= 55 ~ "Morning Type",
+      TRUE ~ NA_character_
+    ),
+    MEQ_category = factor(
+      MEQ_category,
+      levels = c(
+        "Evening Type",
+        "Intermediate Type",
+        "Morning Type"
+      )
+    )
+  ) %>%
+  dplyr::select(id = id, MEQ_score = smith, MEQ_category) %>%
+  dplyr::arrange(MEQ_category, id)
+meq_tally <- meq_by_subject %>%
+  dplyr::count(MEQ_category, name = "n") %>%
+  dplyr::arrange(MEQ_category)
+print(meq_tally)
+#depressive summaries per cohort, starting with younger cohort who used BDI, don't need to do this for demographics tally
+younger_dep <- session_df %>%
+  filter(cohort == "Younger", wave == 0) %>%
+  dplyr::distinct(id, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    bdi_cat = dplyr::case_when(
+      bdi <= 10 ~ "Minimal depressive symptoms",
+      bdi >11  & bdi <= 16 ~ "Mild depressive symptoms",
+      bdi >16 & bdi <= 30 ~ "Moderate depressive symptoms",
+      bdi >30 ~ "Severe depressive symptoms",
+      TRUE ~ NA_character_
+    ),
+    bdi_cat = factor(
+      bdi_cat,
+      levels = c(
+        "Minimal depressive symptoms",
+        "Mild depressive symptoms",
+        "Moderate depressive symptoms",
+        "Severe depressive symptoms"
+      )
+    )
+  ) %>%
+  dplyr::select(id = id, BDI_Score = bdi, bdi_cat) %>%
+  dplyr::arrange(bdi_cat, id)
+bdi_tally <- younger_dep %>%
+  dplyr::count(bdi_cat, name = "n") %>%
+  dplyr::arrange(bdi_cat)
+print(bdi_tally)
+#Now get older cohort who used CES-d
+older_dep <- session_df %>%
+  filter(cohort == "Older", wave == 0) %>%
+  dplyr::distinct(id, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    cesd_cat = dplyr::case_when(
+      cesd <= 9 ~ "Minimal depressive symptoms",
+      cesd >9  & cesd <= 15 ~ "Mild depressive symptoms",
+      cesd >15 & cesd <= 24 ~ "Moderate depressive symptoms",
+      cesd >24 ~ "Severe depressive symptoms",
+      TRUE ~ NA_character_
+    ),
+    cesd_cat = factor(
+      cesd_cat,
+      levels = c(
+        "Minimal depressive symptoms",
+        "Mild depressive symptoms",
+        "Moderate depressive symptoms",
+        "Severe depressive symptoms"
+      )
+    )
+  ) %>%
+  dplyr::select(id = id, CESD_Score = cesd, cesd_cat) %>%
+  dplyr::arrange(cesd_cat, id)
+cesd_tally <- older_dep %>%
+  dplyr::count(cesd_cat, name = "n") %>%
+  dplyr::arrange(cesd_cat)
+print(cesd_tally)
+#sleep-related means
+sleep_summary <- night_df %>%
+  filter(cohort == "Older") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  summarise(
+    mean_onset = as.numeric(mean(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset = as.numeric(sd.circular(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset = mean(offset_hr, na.rm = TRUE),
+    sd_offset = sd(offset_hr, na.rm = TRUE),
+    mean_dur = mean(dur, na.rm = TRUE),
+    sd_dur = sd(dur, na.rm = TRUE),
+    mean_seff = mean(seff, na.rm = TRUE),
+    sd_seff = sd(seff, na.rm = TRUE),
+    mean_waso = mean(waso, na.rm = TRUE),
+    sd_waso = sd(waso, na.rm = TRUE)
+  ) %>%
+  ungroup()
+#sleep-related characteristics for group
+group_sleep_summary <- sleep_summary %>%
+  summarise(
+    mean_onset_group = as.numeric(mean(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset_group = as.numeric(sd.circular(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset_group = mean(mean_offset, na.rm = TRUE),
+    sd_offset_group = sd(mean_offset, na.rm = TRUE),
+    mean_dur_group = mean(mean_dur, na.rm = TRUE),
+    sd_dur_group = sd(mean_dur, na.rm = TRUE),
+    mean_seff_group = mean(mean_seff, na.rm = TRUE),
+    sd_seff_group = sd(mean_seff, na.rm = TRUE),
+    mean_waso_group = mean(mean_waso, na.rm = TRUE),
+    sd_waso_group = sd(mean_waso, na.rm = TRUE)
+  ) %>%
+  mutate(
+    mean_onset_group = sprintf("%02d:%02d", floor(mean_onset_group), round((mean_onset_group %% 1) * 60)),
+    mean_offset_group = sprintf("%02d:%02d", floor(mean_offset_group), round((mean_offset_group %% 1) * 60))
+  )
+
+#Get ranges for continous vars in both cohorts
+range_summary <- session_df %>%
+  filter(wave == 0) %>%
+  group_by(cohort) %>%
+  summarise(across(
+    c(age, BMI, rutter, rcmas, sjl, smith, DLMO, duration, phase_angle_sd),
+    list(min = ~min(., na.rm = TRUE), max = ~max(., na.rm = TRUE))
+  ))
+#ranges for continous vars
+sleep_ranges <- sleep_summary %>%
+  summarise(
+    onset_min = min(mean_onset, na.rm = TRUE),
+    onset_max = max(mean_onset, na.rm = TRUE),
+    offset_min = min(mean_offset, na.rm = TRUE),
+    offset_max = max(mean_offset, na.rm = TRUE),
+    waso_min = min(mean_waso, na.rm = TRUE),
+    waso_max = max(mean_waso, na.rm = TRUE),
+    seff_min = min(mean_seff, na.rm = TRUE),
+    seff_max = max(mean_seff, na.rm = TRUE)
+  )
+
+#Sleep summary younger
+sleep_summary_younger <- night_df %>%
+  filter(cohort == "Younger") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  summarise(
+    mean_onset  = as.numeric(mean(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset    = as.numeric(sd.circular(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset = mean(offset_hr, na.rm = TRUE),
+    sd_offset   = sd(offset_hr,   na.rm = TRUE),
+    mean_dur    = mean(dur,        na.rm = TRUE),
+    sd_dur      = sd(dur,          na.rm = TRUE),
+    mean_seff   = mean(seff,       na.rm = TRUE),
+    sd_seff     = sd(seff,         na.rm = TRUE),
+    mean_waso   = mean(waso,       na.rm = TRUE),
+    sd_waso     = sd(waso,         na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+sleep_summary_older <- night_df %>%
+  filter(cohort == "Older") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  summarise(
+    mean_onset  = as.numeric(mean(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset    = as.numeric(sd.circular(circular(onset_hr, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset = mean(offset_hr, na.rm = TRUE),
+    sd_offset   = sd(offset_hr,   na.rm = TRUE),
+    mean_dur    = mean(dur,        na.rm = TRUE),
+    sd_dur      = sd(dur,          na.rm = TRUE),
+    mean_seff   = mean(seff,       na.rm = TRUE),
+    sd_seff     = sd(seff,         na.rm = TRUE),
+    mean_waso   = mean(waso,       na.rm = TRUE),
+    sd_waso     = sd(waso,         na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+group_sleep_summary_younger <- sleep_summary_younger %>%
+  summarise(
+    mean_onset_group  = as.numeric(mean(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset_group    = as.numeric(sd.circular(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset_group = mean(mean_offset, na.rm = TRUE),
+    sd_offset_group   = sd(mean_offset,   na.rm = TRUE),
+    mean_dur_group    = mean(mean_dur,     na.rm = TRUE),
+    sd_dur_group      = sd(mean_dur,       na.rm = TRUE),
+    mean_seff_group   = mean(mean_seff,    na.rm = TRUE),
+    sd_seff_group     = sd(mean_seff,      na.rm = TRUE),
+    mean_waso_group   = mean(mean_waso,    na.rm = TRUE),
+    sd_waso_group     = sd(mean_waso,      na.rm = TRUE)
+  ) %>%
+  mutate(
+    mean_onset_group  = sprintf("%02d:%02d", floor(mean_onset_group),  round((mean_onset_group  %% 1) * 60)),
+    mean_offset_group = sprintf("%02d:%02d", floor(mean_offset_group), round((mean_offset_group %% 1) * 60))
+  )
+
+group_sleep_summary_older <- sleep_summary_older %>%
+  summarise(
+    mean_onset_group  = as.numeric(mean(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    sd_onset_group    = as.numeric(sd.circular(circular(mean_onset, units = "hours", modulo = "2pi"), na.rm = TRUE)),
+    mean_offset_group = mean(mean_offset, na.rm = TRUE),
+    sd_offset_group   = sd(mean_offset,   na.rm = TRUE),
+    mean_dur_group    = mean(mean_dur,     na.rm = TRUE),
+    sd_dur_group      = sd(mean_dur,       na.rm = TRUE),
+    mean_seff_group   = mean(mean_seff,    na.rm = TRUE),
+    sd_seff_group     = sd(mean_seff,      na.rm = TRUE),
+    mean_waso_group   = mean(mean_waso,    na.rm = TRUE),
+    sd_waso_group     = sd(mean_waso,      na.rm = TRUE)
+  ) %>%
+  mutate(
+    mean_onset_group  = sprintf("%02d:%02d", floor(mean_onset_group),  round((mean_onset_group  %% 1) * 60)),
+    mean_offset_group = sprintf("%02d:%02d", floor(mean_offset_group), round((mean_offset_group %% 1) * 60))
+  )
+
+cor(session_df$midsleep_free, session_df$sjl, use = "complete.obs")
+
+sleep_ranges_younger <- night_df %>%
+  filter(cohort == "Younger") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  summarise(
+    onset_min  = min(onset_hr,  na.rm = TRUE),
+    onset_max  = max(onset_hr,  na.rm = TRUE),
+    offset_min = min(offset_hr, na.rm = TRUE),
+    offset_max = max(offset_hr, na.rm = TRUE),
+    waso_min   = min(waso,      na.rm = TRUE),
+    waso_max   = max(waso,      na.rm = TRUE),
+    seff_min   = min(seff,      na.rm = TRUE),
+    seff_max   = max(seff,      na.rm = TRUE)
+  )
+
+sleep_ranges_older <- night_df %>%
+  filter(cohort == "Older") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  summarise(
+    onset_min  = min(onset_hr,  na.rm = TRUE),
+    onset_max  = max(onset_hr,  na.rm = TRUE),
+    offset_min = min(offset_hr, na.rm = TRUE),
+    offset_max = max(offset_hr, na.rm = TRUE),
+    waso_min   = min(waso,      na.rm = TRUE),
+    waso_max   = max(waso,      na.rm = TRUE),
+    seff_min   = min(seff,      na.rm = TRUE),
+    seff_max   = max(seff,      na.rm = TRUE)
+  )
+#the range isn't correct so can just load data and inspect
+sleep_ranges_older <- night_df %>%
+  filter(cohort == "Older") %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  select(onset_hr, offset_hr, waso, seff)
+#Will return inf jut cause some have na values but that's okay
+range_summary <- session_df %>%
+  filter(wave == 0) %>%
+  group_by(cohort) %>%
+  summarise(across(
+    c(age, BMI, rutter, rcmas, sjl, smith, DLMO, duration, phase_angle_sd, bdi, cesd),
+    list(min = ~min(., na.rm = TRUE), max = ~max(., na.rm = TRUE))
+  ))
+```
+#Mixed-effects models for testing
+```{r test models}
+#Scale outcomes and predictors for standardized estimates, use random slopes for wave/session per participant
+m_meta <- lmer(scale(phase_angle_sd) ~ 1 + scale(age_between) + female + 
+                                       scale(rcmas_within) +  scale(rcmas_between)+ scale(smith_between) + scale(smith_within)+
+                                       (1 + wave | id),
+               data = session_df)
+summary(m_meta)
+isSingular(m_meta)
+VarCorr(m_meta)
+ranova(m_meta)
+re <- ranef(m_meta)$id
+plot(m_meta)
+qqnorm(residuals(m_meta))
+qqline(residuals(m_meta))
+#VIF checker 
+vif_mem <- lm(cpd ~ age_between + rcmas_within + rcmas_between + female + smith_between + smith_within, data = session_df)
+vif_mem_df <- data.frame(
+  predictor = names(vif(vif_mem)),
+  vif       = round(vif(vif_mem), 3)
+)
+print(vif_mem_df)
+#this computes the r2 for the mixed model
+r.squaredGLMM(m_meta)
+all.equal(session_df$phase_angle_sd, session_df$midsleep_sd)
+#I just check vifs afain because I get nervous
+check_collinearity(m_meta)
+confint.merMod(m_meta)
+```
+#ICC
+```{r ICC sd}
+#Need to compute ICC scores for sd-based metrics and abs values separately 
+#Build sd_df from night_df
+sd_df <- night_df %>%
+  group_by(id, session, cohort) %>%
+  summarise(
+    phase_angle_sd      = circular_sd_hr(phase_angle_midsleep_min),
+    midsleep_circ_sd_hr = circular_sd_hr(midsleep_min),
+    onset_circ_sd_hr    = circular_sd_hr(onset_min),
+    offset_circ_sd_hr   = circular_sd_hr(offset_min),
+    duration_sd_hr      = sd(duration_hr, na.rm = TRUE),
+    .groups             = "drop"
+  )
+
+#Build abs_df from session_df
+abs_df <- session_df %>%
+  select(id, session, cohort, DLMO, sjl, smith)
+#can change the number of bootstraps if needed
+calculate_icc <- function(data, variable, nboot = 200) {
+  dat <- data %>%
+    filter(!is.na(.data[[variable]])) %>%
+    mutate(id = factor(id), session_num = as.numeric(as.character(session)))
+  n_obs <- nrow(dat)
+  n_ids <- n_distinct(dat$id)
+#ensure that there is the appropriate amount of obs
+  if (n_obs < 3 || n_ids < 2) {
+    return(tibble(
+      variable,
+      n_obs, n_ids,
+      icc_pct     = NA_real_,
+      icc_lcl_pct = NA_real_,
+      icc_ucl_pct = NA_real_
+    ))
+  }
+#fits mixed-effects model, ri for each participant
+  model <- lmer(as.formula(paste(variable, "~ session_num + (1 | id)")),
+                data = dat, REML = TRUE)
+  #decompose variance into between and within-person components
+  vc          <- as.data.frame(VarCorr(model))
+  var_between <- vc$vcov[vc$grp == "id"]
+  var_within  <- sigma(model)^2
+  icc         <- var_between / (var_between + var_within)
+#same ICC calc to return a single ICC value
+  boot_fun <- function(fit) {
+    vc <- as.data.frame(VarCorr(fit))
+    vb <- vc$vcov[vc$grp == "id"]
+    vw <- sigma(fit)^2
+    vb / (vb + vw)
+  }
+#generate simulated datasets and refit model to simulated dataset and store ICC distribution
+  boot_res <- suppressMessages(bootMer(model, boot_fun, nsim = nboot))
+  ci        <- try(boot.ci(boot_res, type = "perc"), silent = TRUE)
+  lcl       <- if (!inherits(ci, "try-error") && !is.null(ci$percent)) ci$percent[4] else NA_real_
+  ucl       <- if (!inherits(ci, "try-error") && !is.null(ci$percent)) ci$percent[5] else NA_real_
+
+  tibble(
+    variable, n_obs, n_ids,
+    icc_pct     = round(icc * 100, 1),
+    icc_lcl_pct = round(lcl * 100, 1),
+    icc_ucl_pct = round(ucl * 100, 1)
+  )
+}
+#SD outcomes
+sd_outcomes <- c("phase_angle_sd", "midsleep_circ_sd_hr", "onset_circ_sd_hr",
+                 "offset_circ_sd_hr", "duration_sd_hr")
+icc_sd_younger <- sd_df %>% filter(cohort == "Younger") %>%
+  { bind_rows(lapply(sd_outcomes, function(v) calculate_icc(., v))) } %>%
+  mutate(cohort = "Younger")
+icc_sd_older <- sd_df %>% filter(cohort == "Older") %>%
+  { bind_rows(lapply(sd_outcomes, function(v) calculate_icc(., v))) } %>%
+  mutate(cohort = "Older")
+icc_sd_results <- bind_rows(icc_sd_younger, icc_sd_older) %>%
+  relocate(cohort, variable, n_obs, n_ids) %>%
+  arrange(cohort, variable)
+print(icc_sd_results)
+#Absolute outcomes
+abs_outcomes <- c("DLMO", "sjl", "smith")
+icc_abs_younger <- abs_df %>% filter(cohort == "Younger") %>%
+  { bind_rows(lapply(abs_outcomes, function(v) calculate_icc(., v))) } %>%
+  mutate(cohort = "Younger")
+
+icc_abs_older <- abs_df %>% filter(cohort == "Older") %>%
+  { bind_rows(lapply(abs_outcomes, function(v) calculate_icc(., v))) } %>%
+  mutate(cohort = "Older")
+
+icc_abs_results <- bind_rows(icc_abs_younger, icc_abs_older) %>%
+  relocate(cohort, variable, n_obs, n_ids) %>%
+  arrange(cohort, variable)
+print(icc_abs_results)
+out_dir <- "C:/Users/sefarrell/Downloads/ICC_Results"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(icc_sd_results,  file.path(out_dir, "ICC_SD_Report.csv"))
+write_csv(icc_abs_results, file.path(out_dir, "ICC_Absolute_Report.csv"))
+```
+#Correlation PA SD and CPD 
+```{r SJL vs. PA SD}
+#Useful to investigate association between misalignment and phase instability, I like these pastel colours
+wave_colours <- c("0" = "#E69F00", "1" = "#56B4E9", "2" = "#009E73", "3" = "#CC79A7")
+plot_data <- session_df %>%
+  filter(!is.na(phase_angle_sd), !is.na(cpd)) %>%
+  #separate into each wave
+  mutate(wave = as.factor(wave))
+cor_stats <- plot_data %>%
+  group_by(wave) %>%
+  summarise(
+    rho = round(cor(cpd, phase_angle_sd, method = "spearman", use = "complete.obs"), 3),
+    p_val = cor.test(cpd, phase_angle_sd, method = "spearman", exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    #include pvals and labels
+    p_label = ifelse(p_val < 0.001, "p < .001", paste0("p = ", sprintf("%.3f", p_val))),
+    label = paste0("Rho = ", sprintf("%.3f", rho), ", ", p_label)
+  )
+
+make_wave_plot <- function(wave_num) {
+  this_data <- plot_data %>% filter(wave == as.character(wave_num))
+  this_label <- cor_stats %>% filter(wave == as.character(wave_num)) %>% pull(label)
+  this_colour <- wave_colours[[as.character(wave_num)]]
+  ggplot(this_data, aes(x = cpd, y = phase_angle_sd)) +
+    geom_point(size = 2, colour = this_colour, alpha = 0.85) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", fill = "grey80", linewidth = 0.7) +
+    annotate("text", x = -Inf, y = Inf, label = this_label, 
+             hjust = -0.05, vjust = 1.5, size = 5, fontface = "italic") +
+    labs(title = paste("Wave", wave_num + 1), 
+         x = "Composite Phase Deviation", 
+         y = "Phase Angle SD") +
+    theme_minimal(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 17),
+      axis.title.x  = element_text(, face = "bold", size = 14),
+      axis.title.y  = element_text(, face = "bold", size = 14),
+      axis.text = element_text(size = 12),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "grey70", fill = NA, linewidth = 0.5)
+    )
+}
+p0 <- make_wave_plot(0)
+p1 <- make_wave_plot(1)
+p2 <- make_wave_plot(2)
+p3 <- make_wave_plot(3)
+
+final_plot <- (p0 | p1) / (p2 | p3)
+
+ggsave("C:/Users/sefarrell/Downloads/PA_SD_CPD_by_wave.png", 
+       plot = final_plot, width = 10, height = 10, dpi = 300)
+```
+#Spaghetti plot fig1
+```{r fig1}
+#pastel colours 
+wave_colours <- c("1" = "#E69F00", "2" = "#56B4E9", "3" = "#009E73", "4" = "#CC79A7")
+#Compute mean midsleep per session per participant from night_df
+mean_midsleep <- night_df %>%
+  group_by(id, session) %>%
+  summarise(mean_midsleep = mean(midsleep_hr, na.rm = TRUE), .groups = "drop")
+#Merge with session_df to get DLMO and cohort
+plot_df1 <- session_df %>%
+  left_join(mean_midsleep, by = c("id", "session")) %>%
+  select(id, wave, cohort, DLMO, mean_midsleep) %>%
+  mutate(wave = factor(wave, levels = 0:3, labels = c("1", "2", "3", "4")))
+#Compute limits from data
+dlmo_limits     <- range(plot_df1$DLMO, na.rm = TRUE)
+midsleep_limits <- range(plot_df1$mean_midsleep, na.rm = TRUE)
+make_panel <- function(data, measure, y_label, y_limits, title) {
+  data <- data %>% filter(!is.na(.data[[measure]]))
+  pos <- position_jitter(width = 0.1, seed = 42)
+  ggboxplot(data, x = "wave", y = measure,
+            fill = "wave", palette = wave_colours,
+            alpha = 0.25, outlier.shape = NA) +
+    geom_line(aes(x = as.numeric(wave), y = .data[[measure]], group = id),
+              colour = "grey50", alpha = 0.4, linewidth = 0.3,
+              position = pos) +
+    geom_point(aes(x = wave, y = .data[[measure]], colour = wave),
+               position = pos,
+               size = 1.5, alpha = 0.8) +
+    scale_colour_manual(values = wave_colours) +
+    coord_cartesian(ylim = y_limits) +
+    labs(x = "Session", y = y_label, title = title) +
+    theme_pubr() +
+    theme(legend.position = "none") +
+    theme(
+  legend.position = "none",
+  axis.title = element_text(size = 14),
+  axis.text = element_text(size = 12)
+)
+}
+
+#Younger cohort panels (top row)
+p1 <- make_panel(plot_df1 %>% filter(cohort == "Younger"), "DLMO",          "DLMO (hours)",     dlmo_limits,     "DLMO - Aged 9-10 at Baseline")
+p2 <- make_panel(plot_df1 %>% filter(cohort == "Younger"), "mean_midsleep", "Midsleep (hours)", midsleep_limits, "Midsleep")
+p3 <- make_panel(plot_df1 %>% filter(cohort == "Older"),   "DLMO",          "DLMO (hours)",     dlmo_limits,     "DLMO - Aged 11+ at Baseline")
+p4 <- make_panel(plot_df1 %>% filter(cohort == "Older"),   "mean_midsleep", "Midsleep (hours)", midsleep_limits, "Midsleep")
+final_plot1 <- ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+ggsave("C:/Users/sefarrell/Downloads/SandD_Fig1.png", 
+       plot = final_plot1, width = 10, height = 9, dpi = 300)
+```
+#Spaghetti plot fig2
+```{r Spag plots}
+#i like the pastel colours 
+wave_colours <- c("1" = "#E69F00", "2" = "#56B4E9", "3" = "#009E73", "4" = "#CC79A7")
+#Merge with sd_df to get onset_sd and offset_sd
+plot_df3 <- session_df %>%
+  left_join(sd_df %>% select(id, session, onset_circ_sd_hr, offset_circ_sd_hr), 
+            by = c("id", "session")) %>%
+  select(id, wave, cohort, phase_angle_sd, onset_circ_sd_hr, offset_circ_sd_hr) %>%
+  mutate(wave = factor(wave, levels = 0:3, labels = c("1", "2", "3", "4")))
+#Compute limits from data
+pa_limits     <- range(plot_df3$phase_angle_sd, na.rm = TRUE)
+ms_limits     <- range(plot_df3$phase_angle_sd, na.rm = TRUE)
+onset_limits  <- range(plot_df3$onset_circ_sd_hr, na.rm = TRUE)
+offset_limits <- range(plot_df3$offset_circ_sd_hr, na.rm = TRUE)
+make_panel <- function(data, measure, y_label, y_limits, title) {
+  data <- data %>% filter(!is.na(.data[[measure]]))
+  pos <- position_jitter(width = 0.1, seed = 42)
+  
+  ggboxplot(data, x = "wave", y = measure,
+            fill = "wave", palette = wave_colours,
+            alpha = 0.25, outlier.shape = NA) +
+    geom_line(aes(x = as.numeric(wave), y = .data[[measure]], group = id),
+              colour = "grey50", alpha = 0.4, linewidth = 0.3,
+              position = pos) +
+    geom_point(aes(x = wave, y = .data[[measure]], colour = wave),
+               position = pos,
+               size = 1.5, alpha = 0.8) +
+    scale_colour_manual(values = wave_colours) +
+    coord_cartesian(ylim = y_limits) +
+    labs(x = "Session", y = y_label, title = title) +
+    theme_pubr() +
+    theme(legend.position = "none")
+}
+#Younger cohort panels (top row)
+p1 <- make_panel(plot_df3 %>% filter(cohort == "Younger"), "phase_angle_sd",    "Phase Angle SD (hours)", pa_limits,     "Phase Angle SD - Aged 9-10 at Baseline")
+p2 <- make_panel(plot_df3 %>% filter(cohort == "Younger"), "phase_angle_sd",    "Midsleep SD (hours)",    ms_limits,     "Midsleep SD")
+p3 <- make_panel(plot_df3 %>% filter(cohort == "Younger"), "onset_circ_sd_hr",  "Onset SD (hours)",       onset_limits,  "Onset SD")
+p4 <- make_panel(plot_df3 %>% filter(cohort == "Younger"), "offset_circ_sd_hr", "Offset SD (hours)",      offset_limits, "Offset SD")
+#Older cohort panels (bottom row)
+p5 <- make_panel(plot_df3 %>% filter(cohort == "Older"),   "phase_angle_sd",    "Phase Angle SD (hours)", pa_limits,     "Phase Angle SD - Aged 11+ at Baseline")
+p6 <- make_panel(plot_df3 %>% filter(cohort == "Older"),   "phase_angle_sd",    "Midsleep SD (hours)",    ms_limits,     "Midsleep SD")
+p7 <- make_panel(plot_df3 %>% filter(cohort == "Older"),   "onset_circ_sd_hr",  "Onset SD (hours)",       onset_limits,  "Onset SD")
+p8 <- make_panel(plot_df3 %>% filter(cohort == "Older"),   "offset_circ_sd_hr", "Offset SD (hours)",      offset_limits, "Offset SD")
+
+final_plot <- ggarrange(p1, p2, p3, p4, p5, p6, p7, p8, ncol = 4, nrow = 2)
+
+ggsave("C:/Users/sefarrell/Downloads/SandD_final.png", 
+       plot = final_plot, width = 18, height = 9, dpi = 300)
+```
+#stats for demographics
+```{r demog stats}
+session_base <- session_df %>%
+  filter(wave == 0) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(
+    race_cat = case_when(
+      race == 1 ~ "White",
+      race == 2 ~ "Black or African American",
+      race == 3 | race == 7 ~ "Hispanic",
+      race == 6 ~ "Multiple races",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(id, cohort, age, female, race_cat, puberty_stage, smith,
+         BMI, rutter, rcmas, sjl, DLMO, duration, phase_angle_sd,)
+
+night_base <- night_df %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = TRUE) %>%
+  mutate(onset_adj = ifelse(onset_hr < 12, onset_hr + 24, onset_hr)) %>%
+  select(id, onset_adj, offset_hr, dur, seff, waso)
+
+sd_base <- sd_df %>%
+  group_by(id) %>%
+  filter(session == min(session)) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(id, onset_circ_sd_hr, offset_circ_sd_hr,
+         midsleep_circ_sd_hr, duration_sd_hr)
+
+stats_df <- session_base %>%
+  left_join(night_base, by = "id") %>%
+  left_join(sd_base,    by = "id")
+mwu_vars <- c("age", "BMI", "rutter", "rcmas", "sjl", "DLMO", "duration",
+              "phase_angle_sd", "onset_adj", "offset_hr", "seff", "waso",
+              "onset_circ_sd_hr", "offset_circ_sd_hr", "midsleep_circ_sd_hr",
+              "duration_sd_hr", "puberty_stage", "smith")
+
+run_mwu <- function(var, data) {
+  n_young <- sum(!is.na(data[[var]][data$cohort == "Younger"]))
+  n_old   <- sum(!is.na(data[[var]][data$cohort == "Older"]))
+  res <- tryCatch({
+    w <- wilcox.test(data[[var]] ~ data$cohort, exact = FALSE)
+    tibble(variable = var, test = "Mann-Whitney U",
+           statistic = unname(w$statistic), p_value = w$p.value)
+  }, error = function(e) {
+    tibble(variable = var, test = "Mann-Whitney U",
+           statistic = NA_real_, p_value = NA_real_)
+  })
+  res %>% mutate(n_younger = n_young, n_older = n_old)
+}
+
+mwu_results <- bind_rows(lapply(mwu_vars, run_mwu, data = stats_df))
+#Fisher's exact (clean 2x2)
+sex_tab <- table(stats_df$female, stats_df$cohort)
+sex_result <- tibble(
+  variable  = "female",
+  test      = "Fisher's exact",
+  statistic = NA_real_,
+  p_value   = fisher.test(sex_tab)$p.value,
+  n_younger = sum(stats_df$cohort == "Younger" & !is.na(stats_df$female)),
+  n_older   = sum(stats_df$cohort == "Older"   & !is.na(stats_df$female))
+)
+#Fisher's exact (each category vs rest)
+race_tab <- table(stats_df$race_cat, stats_df$cohort)
+
+race_result <- tibble(
+  variable  = "race",
+  test      = "Fisher's score",
+  statistic = NA_real_,
+  p_value   = fisher.test(race_tab, simulate.p.value = TRUE, B = 1e5)$p.value,
+  n_younger = sum(stats_df$cohort == "Younger" & !is.na(stats_df$race_cat)),
+  n_older   = sum(stats_df$cohort == "Older"   & !is.na(stats_df$race_cat))
+)#Combine
+table1_tests <- bind_rows(mwu_results, sex_result, race_result)
+print(table1_tests, n = Inf)
+#Depression (BDI vs CES-D) excluded from testing — instruments not comparable. Write to .csv
+#TO:DO update so .csv can save to your own path
+ write.csv(table1_tests, "your_path_theree", row.names = FALSE)
+```
+
